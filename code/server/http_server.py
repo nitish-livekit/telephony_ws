@@ -1,0 +1,920 @@
+# """
+# Fixed HTTP server for API endpoints and Plivo webhooks - OUTBOUND CALL FIX
+# """
+# import asyncio
+# import time
+# import uuid
+# import logging
+# import subprocess
+# import json
+
+# from aiohttp import web
+# from config import (
+#     TELEPHONY_SAMPLE_RATE, LIVEKIT_SAMPLE_RATE, CALLBACK_WS_URL,
+#     LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET,
+#     HTTP_HOST, HTTP_PORT
+# )
+# from agents.agent_manager import AgentManager
+
+# logger = logging.getLogger(__name__)
+
+
+# class HTTPServerManager:
+#     """Manages HTTP server and API endpoints - FIXED FOR OUTBOUND CALLS"""
+    
+#     def __init__(self):
+#         self.agent_manager = AgentManager()
+#         self.app = self._create_app()
+#         self.runner = None
+#         self.site = None
+#         self.shutdown_event = asyncio.Event()
+    
+#     def _create_app(self):
+#         """Create web application with routes"""
+#         app = web.Application()
+        
+#         # Health and utility endpoints
+#         app.router.add_get("/health", self._handle_health)
+#         app.router.add_post("/trigger", self._handle_trigger_room)
+        
+#         # Plivo-specific endpoints
+#         app.router.add_get("/plivo-app/plivo.xml", self._handle_plivo_xml)
+#         app.router.add_post("/plivo-app/hangup", self._handle_plivo_hangup)
+#         app.router.add_get("/plivo-app/hangup", self._handle_plivo_hangup)
+#         app.router.add_post("/plivo-app/stream-status", self._handle_stream_status)
+#         app.router.add_get("/plivo-app/stream-status", self._handle_stream_status)
+#         app.router.add_post("/plivo-app/trigger-call", self._handle_trigger_call)
+#         app.router.add_get("/plivo-app/answer-and-dispatch", self._handle_answer_and_dispatch)
+#         app.router.add_post("/plivo-app/transfer-xml", self._handle_transfer_xml)
+        
+#         return app
+    
+#     async def _handle_health(self, request):
+#         """Health check endpoint"""
+#         return web.json_response({
+#             "status": "healthy",
+#             "timestamp": time.time(),
+#             "services": {
+#                 "websocket": "running",
+#                 "http": "running",
+#                 "livekit": "configured" if all([LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET]) else "not configured"
+#             },
+#             "config": {
+#                 "telephony_sample_rate": TELEPHONY_SAMPLE_RATE,
+#                 "livekit_sample_rate": LIVEKIT_SAMPLE_RATE,
+#                 "websocket_url": CALLBACK_WS_URL
+#             }
+#         })
+
+#     async def _handle_trigger_room(self, request):
+#         """Trigger agent in a specific room"""
+#         try:
+#             data = await request.json()
+#             room = data["room"]
+            
+#             logger.info(f"🎯 Manual agent trigger for room: {room}")
+#             asyncio.create_task(self.agent_manager.trigger_agent(room))
+            
+#             return web.json_response({
+#                 "status": "triggered",
+#                 "room": room,
+#                 "message": f"Agent triggered for room {room}"
+#             })
+#         except Exception as e:
+#             logger.error(f"❌ Error triggering agent: {e}")
+#             return web.json_response({"error": str(e)}, status=400)
+
+#     async def _handle_plivo_xml(self, request):
+#         """Return Plivo XML for call flow - FIXED FOR OUTBOUND CALLS"""
+#         try:
+#             logger.info("###############_handle_plivo_xml#############")
+#             logger.info(f"Query parameters: {dict(request.query)}")
+#             logger.info("############################")
+
+#             room = request.query.get("room", f"plivo-room-{uuid.uuid4()}")
+#             agent_name = request.query.get("agent", "Mysyara Agent")
+            
+#             # 🆕 CRITICAL FIX: Check if this is an outbound call
+#             outbound_agent_exists = request.query.get("outbound_agent_exists", "false").lower() == "true"
+            
+#             if outbound_agent_exists:
+#                 logger.info(f"🔄 OUTBOUND CALL DETECTED - Agent '{agent_name}' already exists in room '{room}'")
+#                 logger.info(f"🚫 Will NOT dispatch new agent - just connecting WebSocket to existing session")
+#             else:
+#                 logger.info(f"📞 INBOUND CALL DETECTED - Will create new agent '{agent_name}' in room '{room}'")
+
+#             # Get ALL query parameters to pass to WebSocket
+#             query_params = []
+            
+#             # Always include room
+#             query_params.append(f"room={room}")
+            
+#             # Add agent parameter if specified
+#             if "agent" in request.query:
+#                 query_params.append(f"agent={agent_name}")
+#                 logger.info(f"📋 Agent specified in URL: {agent_name}")
+            
+#             # 🆕 CRITICAL: Add outbound_agent_exists parameter
+#             if outbound_agent_exists:
+#                 query_params.append("outbound_agent_exists=true")
+#                 logger.info(f"🔄 Adding outbound_agent_exists=true to WebSocket URL")
+            
+#             # Add background noise parameters if specified
+#             if "bg_noise" in request.query:
+#                 bg_noise = request.query["bg_noise"]
+#                 query_params.append(f"bg_noise={bg_noise}")
+#                 logger.info(f"🔊 Background noise setting: {bg_noise}")
+            
+#             if "noise_type" in request.query:
+#                 noise_type = request.query["noise_type"]
+#                 query_params.append(f"noise_type={noise_type}")
+#                 logger.info(f"🔊 Noise type: {noise_type}")
+            
+#             if "noise_volume" in request.query:
+#                 noise_volume = request.query["noise_volume"]
+#                 query_params.append(f"noise_volume={noise_volume}")
+#                 logger.info(f"🔊 Noise volume: {noise_volume}")
+            
+#             # Build the WebSocket URL with all parameters
+#             ws_url = f"{CALLBACK_WS_URL}/?{'&'.join(query_params)}"
+            
+#             # CRITICAL: Escape & characters for XML
+#             ws_url_escaped = ws_url.replace('&', '&amp;')
+            
+#             logger.info(f"📋 Generating Plivo XML for room: {room}")
+#             logger.info(f"📋 Call type: {'OUTBOUND (agent exists)' if outbound_agent_exists else 'INBOUND (new agent)'}")
+#             logger.info(f"📋 Original WebSocket URL: {ws_url}")
+#             logger.info(f"📋 XML-escaped WebSocket URL: {ws_url_escaped}")
+            
+#             # Plivo XML response with properly escaped URL
+#             response_text = f"""<?xml version="1.0" encoding="UTF-8"?>
+# <Response>
+#     <Stream 
+#         bidirectional="true" 
+#         keepCallAlive="true" 
+#         contentType="audio/x-mulaw;rate=8000"
+#         streamTimeout="3600"
+#         statusCallbackUrl="{request.url.scheme}://{request.host}/plivo-app/stream-status"
+#     >{ws_url_escaped}</Stream>
+# </Response>"""
+            
+#             logger.info(f"📋 Generated XML:")
+#             for i, line in enumerate(response_text.split('\n'), 1):
+#                 if line.strip():  # Only log non-empty lines
+#                     logger.info(f"📋 Line {i}: {line}")
+            
+#             return web.Response(text=response_text, content_type="text/xml")
+            
+#         except Exception as e:
+#             logger.error(f"❌ Error generating Plivo XML: {e}")
+#             import traceback
+#             traceback.print_exc()
+            
+#             # Return simple fallback XML
+#             fallback_xml = f"""<?xml version="1.0" encoding="UTF-8"?>
+# <Response>
+#     <Stream bidirectional="true" keepCallAlive="true" contentType="audio/x-mulaw;rate=8000">{CALLBACK_WS_URL}/?room={room}</Stream>
+# </Response>"""
+            
+#             logger.error(f"📋 Returning fallback XML: {fallback_xml}")
+#             return web.Response(text=fallback_xml, content_type="text/xml")
+
+#     async def _handle_plivo_hangup(self, request):
+#         """Handle Plivo hangup callback"""
+#         try:
+#             # Parse request data
+#             if request.method == 'POST':
+#                 try:
+#                     data = await request.json()
+#                 except:
+#                     data = dict(await request.post())
+#             else:
+#                 data = dict(request.query)
+            
+#             call_uuid = data.get('CallUUID', data.get('call_uuid', 'unknown'))
+#             hangup_cause = data.get('HangupCause', data.get('hangup_cause', 'unknown'))
+#             hangup_source = data.get('HangupSource', data.get('hangup_source', 'unknown'))
+#             call_duration = data.get('Duration', data.get('duration', '0'))
+            
+#             logger.info(f"📞 HANGUP CALLBACK - Call: {call_uuid}")
+#             logger.info(f"   Cause: {hangup_cause}")
+#             logger.info(f"   Source: {hangup_source}")
+#             logger.info(f"   Duration: {call_duration}s")
+#             logger.info(f"   Full data: {data}")
+            
+#             return web.Response(text="OK", status=200)
+            
+#         except Exception as e:
+#             logger.error(f"❌ Error processing hangup callback: {e}")
+#             return web.Response(text="Error", status=500)
+
+#     async def _handle_stream_status(self, request):
+#         """Handle Plivo stream status callback"""
+#         try:
+#             if request.method == 'POST':
+#                 try:
+#                     data = await request.json()
+#                 except:
+#                     data = dict(await request.post())
+#             else:
+#                 data = dict(request.query)
+            
+#             stream_id = data.get('StreamId', data.get('stream_id', 'unknown'))
+#             call_uuid = data.get('CallUUID', data.get('call_uuid', 'unknown'))
+#             status = data.get('Status', data.get('status', 'unknown'))
+            
+#             logger.info(f"📡 STREAM STATUS - Stream: {stream_id}")
+#             logger.info(f"   Call: {call_uuid}")
+#             logger.info(f"   Status: {status}")
+#             logger.info(f"   Full data: {data}")
+            
+#             return web.Response(text="OK", status=200)
+            
+#         except Exception as e:
+#             logger.error(f"❌ Error processing stream status: {e}")
+#             return web.Response(text="Error", status=500)
+
+#     async def _handle_trigger_call(self, request):
+#         """Trigger a new call via Plivo API - for testing purposes"""
+#         try:
+#             data = await request.json()
+#             logger.info("###############Handle_Trigger_call#############")
+#             logger.info(f"Request is {request}")
+#             logger.info("############################")
+#             to_number = data["to"]
+#             from_number = data["from"] 
+#             room = data.get("room", f"plivo-room-{uuid.uuid4()}")
+            
+#             logger.info(f"📞 Triggering Plivo call: {from_number} -> {to_number} (room: {room})")
+            
+#             # This would require Plivo credentials - implement if needed
+#             return web.json_response({
+#                 "status": "not_implemented",
+#                 "room": room,
+#                 "message": f"Call triggering not implemented - add Plivo credentials and uncomment code"
+#             })
+#         except Exception as e:
+#             logger.error(f"❌ Error triggering call: {e}")
+#             return web.json_response({"error": str(e)}, status=400)
+    
+#     async def start_server(self):
+#         """Start HTTP server and wait for shutdown"""
+#         try:
+#             # Setup the application runner
+#             self.runner = web.AppRunner(self.app)
+#             await self.runner.setup()
+            
+#             # Create TCP site
+#             self.site = web.TCPSite(self.runner, HTTP_HOST, HTTP_PORT)
+#             await self.site.start()
+            
+#             logger.info(f"🌐 HTTP server listening on http://{HTTP_HOST}:{HTTP_PORT}")
+#             logger.info(f"📋 Plivo XML endpoint: http://{HTTP_HOST}:{HTTP_PORT}/plivo-app/plivo.xml")
+#             logger.info(f"📞 Plivo hangup callback: http://{HTTP_HOST}:{HTTP_PORT}/plivo-app/hangup")
+            
+#             # Wait for shutdown signal
+#             await self.shutdown_event.wait()
+            
+#             # Cleanup
+#             await self._cleanup()
+            
+#         except Exception as e:
+#             logger.error(f"❌ Error in HTTP server: {e}")
+#             import traceback
+#             traceback.print_exc()
+#             raise
+    
+#     def initiate_shutdown(self):
+#         """Initiate HTTP server shutdown"""
+#         logger.info("📶 HTTP server shutdown initiated")
+#         self.shutdown_event.set()
+    
+#     async def _cleanup(self):
+#         """Cleanup HTTP server resources"""
+#         logger.info("🧹 Cleaning up HTTP server...")
+        
+#         try:
+#             if self.site:
+#                 await self.site.stop()
+#                 logger.info("✅ HTTP site stopped")
+            
+#             if self.runner:
+#                 await self.runner.cleanup()
+#                 logger.info("✅ HTTP runner cleaned up")
+#         except Exception as e:
+#             logger.error(f"❌ Error cleaning up HTTP server: {e}")
+        
+#         logger.info("✅ HTTP server cleanup complete")
+
+#     async def _handle_answer_and_dispatch(self, request):
+#         """
+#         Called by Plivo when customer answers outbound call.
+#         Dispatches the agent and returns WebSocket streaming XML.
+#         """
+#         try:
+#             import subprocess
+#             import json
+#             from urllib.parse import quote_plus
+            
+#             # Extract parameters from query string
+#             room = request.query.get("room")
+#             agent = request.query.get("agent") 
+#             call_db_id = request.query.get("call_db_id")
+#             bg_noise = request.query.get("bg_noise", "true")
+#             noise_type = request.query.get("noise_type", "call-center")
+#             noise_volume = request.query.get("noise_volume", "0.15")
+            
+#             if not room or not agent:
+#                 logger.error(f"❌ Missing required parameters: room={room}, agent={agent}")
+#                 return web.Response(text="Missing parameters", status=400)
+            
+#             logger.info(f"🟢 Customer answered outbound call! Room: {room}, Agent: {agent}")
+            
+#             # Get Plivo call parameters
+#             plivo_call_uuid = request.query.get("CallUUID", "unknown")
+#             from_number = request.query.get("From", "unknown") 
+#             to_number = request.query.get("To", "unknown")
+#             call_status = request.query.get("CallStatus", "unknown")
+            
+#             # Step 1: Dispatch agent NOW (customer has answered)
+#             metadata = {
+#                 "direction": "inbound",
+#                 "phone": to_number,
+#                 "from": from_number,
+#                 "plivo_call_uuid": plivo_call_uuid,
+#                 "agent_name": agent,
+#                 "room": room,
+#                 "call_type": "outbound_answered"
+#             }
+            
+#             metadata_json = json.dumps(metadata)
+            
+#             logger.info(f"🤖 Dispatching agent '{agent}' to room '{room}'...")
+#             agent_process = subprocess.Popen([
+#                 "lk", "dispatch", "create",
+#                 "--room", room,
+#                 "--agent-name", agent,
+#                 "--metadata", metadata_json
+#             ], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+#             logger.info(f"📞 Plivo Call Details:")
+#             logger.info(f"   CallUUID: {plivo_call_uuid}")
+#             logger.info(f"   From: {from_number}")
+#             logger.info(f"   To: {to_number}")
+#             logger.info(f"   Status: {call_status}")
+            
+#             logger.info(f"✅ Agent '{agent}' dispatched to room '{room}' (PID: {agent_process.pid})")
+            
+#             # Step 2: Build WebSocket URL with correct parameters
+#             room_encoded = quote_plus(room)
+#             agent_encoded = quote_plus(agent)
+#             bg_noise_encoded = quote_plus(bg_noise)
+#             noise_type_encoded = quote_plus(noise_type)
+#             noise_volume_encoded = quote_plus(noise_volume)
+            
+#             # Use correct WebSocket URL and WSS protocol
+#             ws_url = f"wss://pacewisdom-ws.vaaniresearch.com/plivo-ws/?room={room_encoded}&agent={agent_encoded}&bg_noise={bg_noise_encoded}&noise_type={noise_type_encoded}&noise_volume={noise_volume_encoded}"
+            
+#             # XML-escape the URL for use in XML
+#             ws_url_escaped = ws_url.replace('&', '&amp;')
+            
+#             logger.info(f"🔗 WebSocket URL (raw): {ws_url}")
+#             logger.info(f"🔗 WebSocket URL (XML-escaped): {ws_url_escaped}")
+            
+#             # Step 3: Return XML for WebSocket streaming
+#             response_text = f"""<?xml version="1.0" encoding="UTF-8"?>
+#     <Response>
+#         <Stream 
+#             bidirectional="true" 
+#             keepCallAlive="true" 
+#             contentType="audio/x-mulaw;rate=8000"
+#             streamTimeout="3600"
+#             statusCallbackUrl="https://pacewisdom-ws.vaaniresearch.com/plivo-app/stream-status?call_db_id={call_db_id}"
+#         >{ws_url_escaped}</Stream>
+#     </Response>"""
+            
+#             logger.info(f"📋 Returning XML for answered call - WebSocket streaming initiated")
+            
+#             return web.Response(text=response_text, content_type="text/xml")
+            
+#         except Exception as e:
+#             logger.error(f"❌ Error in answer-and-dispatch: {e}")
+#             import traceback
+#             traceback.print_exc()
+            
+#             # Return simple hangup XML on error
+#             fallback_xml = """<?xml version="1.0" encoding="UTF-8"?>
+#     <Response>
+#         <Hangup/>
+#     </Response>"""
+#             return web.Response(text=fallback_xml, content_type="text/xml")  
+
+#     async def _handle_transfer_xml(self, request):
+#         """XML endpoint for transfers - shared by all clients"""
+#         try:
+#             to_number = request.query.get("to")
+#             from_number = request.query.get("from")
+
+#             # Clean inputs
+#             to = to_number.strip()
+#             from_ = from_number.strip()
+
+#             logger.info(f"📞 Transfer XML requested: {from_} → {to}")
+
+#             transfer_xml = f"""<?xml version="1.0" encoding="UTF-8"?>
+#     <Response>
+#         <Dial 
+#             callerId="{from_}"
+#             timeout="30"
+#             timeLimit="3600"
+#             hangupOnStar="true"
+#         >
+#             <Number>{to}</Number>
+#         </Dial>
+#     </Response>"""
+
+#             return web.Response(text=transfer_xml, content_type="text/xml")
+
+#         except Exception as e:
+#             logger.error(f"❌ Transfer XML error: {e}")
+#             return web.Response(
+#                 text='<?xml version="1.0" encoding="UTF-8"?><Response><Hangup/></Response>',
+#                 content_type="text/xml"
+#             )
+
+
+
+
+
+
+
+"""
+Fixed HTTP server for API endpoints and Plivo webhooks - WITH CALL ACCEPTANCE CONTROL
+"""
+import asyncio
+import time
+import uuid
+import logging
+import subprocess
+import json
+
+from aiohttp import web
+from config import (
+    TELEPHONY_SAMPLE_RATE, LIVEKIT_SAMPLE_RATE, CALLBACK_WS_URL,
+    LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET,
+    HTTP_HOST, HTTP_PORT, AGENT_NAME, 
+    should_accept_call, get_reject_message, get_agent_name
+)
+from agents.agent_manager import AgentManager
+
+logger = logging.getLogger(__name__)
+
+
+class HTTPServerManager:
+    """Manages HTTP server and API endpoints - WITH CALL ACCEPTANCE CONTROL"""
+    
+    def __init__(self):
+        self.agent_manager = AgentManager()
+        self.app = self._create_app()
+        self.runner = None
+        self.site = None
+        self.shutdown_event = asyncio.Event()
+    
+    def _create_app(self):
+        """Create web application with routes"""
+        app = web.Application()
+        
+        # Health and utility endpoints
+        app.router.add_get("/health", self._handle_health)
+        app.router.add_post("/trigger", self._handle_trigger_room)
+        
+        # Plivo-specific endpoints
+        app.router.add_get("/plivo-app/plivo.xml", self._handle_plivo_xml)
+        app.router.add_post("/plivo-app/hangup", self._handle_plivo_hangup)
+        app.router.add_get("/plivo-app/hangup", self._handle_plivo_hangup)
+        app.router.add_post("/plivo-app/stream-status", self._handle_stream_status)
+        app.router.add_get("/plivo-app/stream-status", self._handle_stream_status)
+        app.router.add_post("/plivo-app/trigger-call", self._handle_trigger_call)
+        app.router.add_get("/plivo-app/answer-and-dispatch", self._handle_answer_and_dispatch)
+        app.router.add_post("/plivo-app/transfer-xml", self._handle_transfer_xml)
+        
+        return app
+    
+    async def _handle_health(self, request):
+        """Health check endpoint"""
+        return web.json_response({
+            "status": "healthy",
+            "timestamp": time.time(),
+            "services": {
+                "websocket": "running",
+                "http": "running",
+                "livekit": "configured" if all([LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET]) else "not configured"
+            },
+            "config": {
+                "telephony_sample_rate": TELEPHONY_SAMPLE_RATE,
+                "livekit_sample_rate": LIVEKIT_SAMPLE_RATE,
+                "websocket_url": CALLBACK_WS_URL,
+                "default_agent": AGENT_NAME,
+                "accepting_calls": should_accept_call()
+            }
+        })
+
+    async def _handle_trigger_room(self, request):
+        """Trigger agent in a specific room"""
+        try:
+            data = await request.json()
+            room = data["room"]
+            agent_name = get_agent_name(data.get("agent"))
+            
+            logger.info(f"🎯 Manual agent trigger for room: {room}, agent: {agent_name}")
+            asyncio.create_task(self.agent_manager.trigger_agent(room, agent_name))
+            
+            return web.json_response({
+                "status": "triggered",
+                "room": room,
+                "agent": agent_name,
+                "message": f"Agent '{agent_name}' triggered for room {room}"
+            })
+        except Exception as e:
+            logger.error(f"❌ Error triggering agent: {e}")
+            return web.json_response({"error": str(e)}, status=400)
+
+    async def _handle_plivo_xml(self, request):
+        """Return Plivo XML for call flow - WITH CALL ACCEPTANCE CONTROL"""
+        try:
+            logger.info("###############_handle_plivo_xml#############")
+            logger.info(f"Query parameters: {dict(request.query)}")
+            
+            # NEW: Check if we should accept incoming calls
+            if not should_accept_call():
+                logger.warning("🚫 INCOMING CALLS DISABLED - Rejecting call")
+                reject_message = get_reject_message()
+                
+                # Return XML that plays a message and hangs up
+                reject_xml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Hangup/>
+</Response>"""
+                
+                logger.info(f"📋 Returning call rejection XML: {reject_message}")
+                return web.Response(text=reject_xml, content_type="text/xml")
+            
+            # Continue with normal call processing
+            room = request.query.get("room", f"plivo-room-{uuid.uuid4()}")
+            
+            # NEW: Use agent name from environment with override support
+            agent_name = get_agent_name(request.query.get("agent"))
+            
+            logger.info(f"✅ ACCEPTING INCOMING CALL - Room: {room}, Agent: {agent_name}")
+            
+            # Check if this is an outbound call
+            outbound_agent_exists = request.query.get("outbound_agent_exists", "false").lower() == "true"
+            
+            if outbound_agent_exists:
+                logger.info(f"🔄 OUTBOUND CALL DETECTED - Agent '{agent_name}' already running in room '{room}'")
+                logger.info(f"🚫 Will NOT dispatch new agent - just connecting WebSocket to existing session")
+            else:
+                logger.info(f"📞 INBOUND CALL DETECTED - Will create new agent '{agent_name}' in room '{room}'")
+
+            # Get ALL query parameters to pass to WebSocket
+            query_params = []
+            
+            # Always include room and agent
+            query_params.append(f"room={room}")
+            query_params.append(f"agent={agent_name}")
+            
+            # Add outbound flag if needed
+            if outbound_agent_exists:
+                query_params.append("outbound_agent_exists=true")
+                logger.info(f"🔄 Adding outbound_agent_exists=true to WebSocket URL")
+            
+            # Add background noise parameters if specified
+            if "bg_noise" in request.query:
+                bg_noise = request.query["bg_noise"]
+                query_params.append(f"bg_noise={bg_noise}")
+                logger.info(f"🔊 Background noise setting: {bg_noise}")
+            
+            if "noise_type" in request.query:
+                noise_type = request.query["noise_type"]
+                query_params.append(f"noise_type={noise_type}")
+                logger.info(f"🔊 Noise type: {noise_type}")
+            
+            if "noise_volume" in request.query:
+                noise_volume = request.query["noise_volume"]
+                query_params.append(f"noise_volume={noise_volume}")
+                logger.info(f"🔊 Noise volume: {noise_volume}")
+            
+            # Build the WebSocket URL with all parameters
+            ws_url = f"{CALLBACK_WS_URL}/?{'&'.join(query_params)}"
+            
+            # CRITICAL: Escape & characters for XML
+            ws_url_escaped = ws_url.replace('&', '&amp;')
+            
+            logger.info(f"📋 Generating Plivo XML for room: {room}")
+            logger.info(f"📋 Call type: {'OUTBOUND (agent exists)' if outbound_agent_exists else 'INBOUND (new agent)'}")
+            logger.info(f"📋 Agent name: {agent_name}")
+            logger.info(f"📋 Original WebSocket URL: {ws_url}")
+            logger.info(f"📋 XML-escaped WebSocket URL: {ws_url_escaped}")
+            
+            # Plivo XML response with properly escaped URL
+            response_text = f"""<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Stream 
+        bidirectional="true" 
+        keepCallAlive="true" 
+        contentType="audio/x-mulaw;rate=8000"
+        streamTimeout="3600"
+        statusCallbackUrl="{request.url.scheme}://{request.host}/plivo-app/stream-status"
+    >{ws_url_escaped}</Stream>
+</Response>"""
+            
+            logger.info(f"📋 Generated XML:")
+            for i, line in enumerate(response_text.split('\n'), 1):
+                if line.strip():  # Only log non-empty lines
+                    logger.info(f"📋 Line {i}: {line}")
+            
+            return web.Response(text=response_text, content_type="text/xml")
+            
+        except Exception as e:
+            logger.error(f"❌ Error generating Plivo XML: {e}")
+            import traceback
+            traceback.print_exc()
+            
+            # Return simple fallback XML
+            fallback_xml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Stream bidirectional="true" keepCallAlive="true" contentType="audio/x-mulaw;rate=8000">{CALLBACK_WS_URL}/?room={request.query.get("room", f"plivo-room-{uuid.uuid4()}")}&agent={get_agent_name()}</Stream>
+</Response>"""
+            
+            logger.error(f"📋 Returning fallback XML: {fallback_xml}")
+            return web.Response(text=fallback_xml, content_type="text/xml")
+
+    async def _handle_plivo_hangup(self, request):
+        """Handle Plivo hangup callback"""
+        try:
+            # Parse request data
+            if request.method == 'POST':
+                try:
+                    data = await request.json()
+                except:
+                    data = dict(await request.post())
+            else:
+                data = dict(request.query)
+            
+            call_uuid = data.get('CallUUID', data.get('call_uuid', 'unknown'))
+            hangup_cause = data.get('HangupCause', data.get('hangup_cause', 'unknown'))
+            hangup_source = data.get('HangupSource', data.get('hangup_source', 'unknown'))
+            call_duration = data.get('Duration', data.get('duration', '0'))
+            
+            logger.info(f"📞 HANGUP CALLBACK - Call: {call_uuid}")
+            logger.info(f"   Cause: {hangup_cause}")
+            logger.info(f"   Source: {hangup_source}")
+            logger.info(f"   Duration: {call_duration}s")
+            logger.info(f"   Full data: {data}")
+            
+            return web.Response(text="OK", status=200)
+            
+        except Exception as e:
+            logger.error(f"❌ Error processing hangup callback: {e}")
+            return web.Response(text="Error", status=500)
+
+    async def _handle_stream_status(self, request):
+        """Handle Plivo stream status callback"""
+        try:
+            if request.method == 'POST':
+                try:
+                    data = await request.json()
+                except:
+                    data = dict(await request.post())
+            else:
+                data = dict(request.query)
+            
+            stream_id = data.get('StreamId', data.get('stream_id', 'unknown'))
+            call_uuid = data.get('CallUUID', data.get('call_uuid', 'unknown'))
+            status = data.get('Status', data.get('status', 'unknown'))
+            
+            logger.info(f"📡 STREAM STATUS - Stream: {stream_id}")
+            logger.info(f"   Call: {call_uuid}")
+            logger.info(f"   Status: {status}")
+            logger.info(f"   Full data: {data}")
+            
+            return web.Response(text="OK", status=200)
+            
+        except Exception as e:
+            logger.error(f"❌ Error processing stream status: {e}")
+            return web.Response(text="Error", status=500)
+
+    async def _handle_trigger_call(self, request):
+        """Trigger a new call via Plivo API - for testing purposes"""
+        try:
+            data = await request.json()
+            logger.info("###############Handle_Trigger_call#############")
+            logger.info(f"Request is {request}")
+            logger.info("############################")
+            to_number = data["to"]
+            from_number = data["from"] 
+            room = data.get("room", f"plivo-room-{uuid.uuid4()}")
+            agent_name = get_agent_name(data.get("agent"))
+            
+            logger.info(f"📞 Triggering Plivo call: {from_number} -> {to_number} (room: {room}, agent: {agent_name})")
+            
+            # This would require Plivo credentials - implement if needed
+            return web.json_response({
+                "status": "not_implemented",
+                "room": room,
+                "agent": agent_name,
+                "message": f"Call triggering not implemented - add Plivo credentials and uncomment code"
+            })
+        except Exception as e:
+            logger.error(f"❌ Error triggering call: {e}")
+            return web.json_response({"error": str(e)}, status=400)
+    
+    async def start_server(self):
+        """Start HTTP server and wait for shutdown"""
+        try:
+            # Setup the application runner
+            self.runner = web.AppRunner(self.app)
+            await self.runner.setup()
+            
+            # Create TCP site
+            self.site = web.TCPSite(self.runner, HTTP_HOST, HTTP_PORT)
+            await self.site.start()
+            
+            logger.info(f"🌐 HTTP server listening on http://{HTTP_HOST}:{HTTP_PORT}")
+            logger.info(f"📋 Plivo XML endpoint: http://{HTTP_HOST}:{HTTP_PORT}/plivo-app/plivo.xml")
+            logger.info(f"📞 Plivo hangup callback: http://{HTTP_HOST}:{HTTP_PORT}/plivo-app/hangup")
+            logger.info(f"🤖 Default agent name: {AGENT_NAME}")
+            logger.info(f"📞 Accepting incoming calls: {should_accept_call()}")
+            
+            if not should_accept_call():
+                logger.warning(f"🚫 INCOMING CALLS DISABLED - Will reject with: '{get_reject_message()}'")
+            
+            # Wait for shutdown signal
+            await self.shutdown_event.wait()
+            
+            # Cleanup
+            await self._cleanup()
+            
+        except Exception as e:
+            logger.error(f"❌ Error in HTTP server: {e}")
+            import traceback
+            traceback.print_exc()
+            raise
+    
+    def initiate_shutdown(self):
+        """Initiate HTTP server shutdown"""
+        logger.info("📶 HTTP server shutdown initiated")
+        self.shutdown_event.set()
+    
+    async def _cleanup(self):
+        """Cleanup HTTP server resources"""
+        logger.info("🧹 Cleaning up HTTP server...")
+        
+        try:
+            if self.site:
+                await self.site.stop()
+                logger.info("✅ HTTP site stopped")
+            
+            if self.runner:
+                await self.runner.cleanup()
+                logger.info("✅ HTTP runner cleaned up")
+        except Exception as e:
+            logger.error(f"❌ Error cleaning up HTTP server: {e}")
+        
+        logger.info("✅ HTTP server cleanup complete")
+
+    async def _handle_answer_and_dispatch(self, request):
+        """
+        Called by Plivo when customer answers outbound call.
+        Dispatches the agent and returns WebSocket streaming XML.
+        """
+        try:
+            import subprocess
+            import json
+            from urllib.parse import quote_plus
+            
+            # Extract parameters from query string
+            room = request.query.get("room")
+            agent = get_agent_name(request.query.get("agent"))  # NEW: Use config function
+            call_db_id = request.query.get("call_db_id")
+            bg_noise = request.query.get("bg_noise", "true")
+            noise_type = request.query.get("noise_type", "call-center")
+            noise_volume = request.query.get("noise_volume", "0.15")
+            
+            if not room or not agent:
+                logger.error(f"❌ Missing required parameters: room={room}, agent={agent}")
+                return web.Response(text="Missing parameters", status=400)
+            
+            logger.info(f"🟢 Customer answered outbound call! Room: {room}, Agent: {agent}")
+            
+            # Get Plivo call parameters
+            plivo_call_uuid = request.query.get("CallUUID", "unknown")
+            from_number = request.query.get("From", "unknown") 
+            to_number = request.query.get("To", "unknown")
+            call_status = request.query.get("CallStatus", "unknown")
+            
+            # Step 1: Dispatch agent NOW (customer has answered)
+            metadata = {
+                "direction": "inbound",
+                "phone": to_number,
+                "from": from_number,
+                "plivo_call_uuid": plivo_call_uuid,
+                "agent_name": agent,
+                "room": room,
+                "call_type": "outbound_answered"
+            }
+            
+            metadata_json = json.dumps(metadata)
+            
+            logger.info(f"🤖 Dispatching agent '{agent}' to room '{room}'...")
+            agent_process = subprocess.Popen([
+                "lk", "dispatch", "create",
+                "--room", room,
+                "--agent-name", agent,
+                "--metadata", metadata_json
+            ], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+            logger.info(f"📞 Plivo Call Details:")
+            logger.info(f"   CallUUID: {plivo_call_uuid}")
+            logger.info(f"   From: {from_number}")
+            logger.info(f"   To: {to_number}")
+            logger.info(f"   Status: {call_status}")
+            
+            logger.info(f"✅ Agent '{agent}' dispatched to room '{room}' (PID: {agent_process.pid})")
+            
+            # Step 2: Build WebSocket URL with correct parameters
+            room_encoded = quote_plus(room)
+            agent_encoded = quote_plus(agent)
+            bg_noise_encoded = quote_plus(bg_noise)
+            noise_type_encoded = quote_plus(noise_type)
+            noise_volume_encoded = quote_plus(noise_volume)
+            
+            # Use correct WebSocket URL and WSS protocol
+            ws_url = f"wss://pacewisdom-ws.vaaniresearch.com/plivo-ws/?room={room_encoded}&agent={agent_encoded}&bg_noise={bg_noise_encoded}&noise_type={noise_type_encoded}&noise_volume={noise_volume_encoded}"
+            
+            # XML-escape the URL for use in XML
+            ws_url_escaped = ws_url.replace('&', '&amp;')
+            
+            logger.info(f"🔗 WebSocket URL (raw): {ws_url}")
+            logger.info(f"🔗 WebSocket URL (XML-escaped): {ws_url_escaped}")
+            
+            # Step 3: Return XML for WebSocket streaming
+            response_text = f"""<?xml version="1.0" encoding="UTF-8"?>
+    <Response>
+        <Stream 
+            bidirectional="true" 
+            keepCallAlive="true" 
+            contentType="audio/x-mulaw;rate=8000"
+            streamTimeout="3600"
+            statusCallbackUrl="https://pacewisdom-ws.vaaniresearch.com/plivo-app/stream-status?call_db_id={call_db_id}"
+        >{ws_url_escaped}</Stream>
+    </Response>"""
+            
+            logger.info(f"📋 Returning XML for answered call - WebSocket streaming initiated")
+            
+            return web.Response(text=response_text, content_type="text/xml")
+            
+        except Exception as e:
+            logger.error(f"❌ Error in answer-and-dispatch: {e}")
+            import traceback
+            traceback.print_exc()
+            
+            # Return simple hangup XML on error
+            fallback_xml = """<?xml version="1.0" encoding="UTF-8"?>
+    <Response>
+        <Hangup/>
+    </Response>"""
+            return web.Response(text=fallback_xml, content_type="text/xml")  
+
+    async def _handle_transfer_xml(self, request):
+        """XML endpoint for transfers - shared by all clients"""
+        try:
+            to_number = request.query.get("to")
+            from_number = request.query.get("from")
+
+            # Clean inputs
+            to = to_number.strip()
+            from_ = from_number.strip()
+
+            logger.info(f"📞 Transfer XML requested: {from_} → {to}")
+
+            transfer_xml = f"""<?xml version="1.0" encoding="UTF-8"?>
+    <Response>
+        <Dial 
+            callerId="{from_}"
+            timeout="30"
+            timeLimit="3600"
+            hangupOnStar="true"
+        >
+            <Number>{to}</Number>
+        </Dial>
+    </Response>"""
+
+            return web.Response(text=transfer_xml, content_type="text/xml")
+
+        except Exception as e:
+            logger.error(f"❌ Transfer XML error: {e}")
+            return web.Response(
+                text='<?xml version="1.0" encoding="UTF-8"?><Response><Hangup/></Response>',
+                content_type="text/xml"
+            )
