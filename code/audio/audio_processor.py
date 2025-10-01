@@ -1,9 +1,10 @@
 """
-Audio processing utilities for telephony-LiveKit bridge - FIXED BACKGROUND VERSION
+Audio processing with proper mixing - agent + background
 """
 import audioop
 import numpy as np
 import logging
+import array
 from livekit import rtc
 from config import TELEPHONY_SAMPLE_RATE, LIVEKIT_SAMPLE_RATE
 from audio.noise_manager import NoiseManager
@@ -12,7 +13,7 @@ logger = logging.getLogger(__name__)
 
 
 class AudioProcessor:
-    """Handles audio conversion and processing between telephony and LiveKit - FIXED VERSION"""
+    """Handles audio conversion and mixing"""
     
     def __init__(self):
         self.return_resampler = rtc.AudioResampler(
@@ -24,22 +25,18 @@ class AudioProcessor:
         self.noise_manager = NoiseManager()
         self.is_active = True
         
-    def create_return_resampler(self):
-        """Create resampler for return audio path (LiveKit -> Telephony)"""
-        return rtc.AudioResampler(
-            input_rate=LIVEKIT_SAMPLE_RATE,
-            output_rate=TELEPHONY_SAMPLE_RATE,
-            num_channels=1,
-            quality=rtc.AudioResamplerQuality.HIGH
-        )
-    
+        # Log status
+        status = self.noise_manager.get_status()
+        logger.info(f"🔊 AudioProcessor: noise enabled={status['enabled']}, "
+                   f"type={status.get('noise_type', 'N/A')}, "
+                   f"volume={status.get('volume', 'N/A')}")
+        
     def convert_livekit_to_telephony(self, audio_frame):
-        """Convert LiveKit audio frame to telephony μ-law format WITHOUT background noise"""
+        """Convert LiveKit audio to telephony μ-law"""
         if not self.is_active:
             return []
             
         try:
-            # Resample from 48kHz to 8kHz for telephony
             resampled_frames = self.return_resampler.push(audio_frame)
             
             telephony_audio_data = []
@@ -51,123 +48,102 @@ class AudioProcessor:
                 # Convert to PCM bytes
                 pcm_bytes = bytes(resampled_frame.data[:resampled_frame.samples_per_channel * 2])
                 
-                # Add subtle noise to improve audio quality
-                noisy_pcm = self._add_audio_noise(pcm_bytes)
+                # Convert to μ-law
+                mulaw_bytes = audioop.lin2ulaw(pcm_bytes, 2)
                 
-                # Convert PCM to μ-law for telephony
-                mulaw_bytes = audioop.lin2ulaw(noisy_pcm, 2)
-                
-                # NO background noise here - this is clean agent audio
                 telephony_audio_data.append(mulaw_bytes)
                 
             return telephony_audio_data
             
         except Exception as e:
-            logger.error(f"❌ Error converting LiveKit audio to telephony: {e}")
+            logger.error(f"❌ Error converting audio: {e}")
             return []
     
-    # def mix_agent_audio_with_background(self, agent_audio_data):
-    #     """Mix clean agent audio with background noise for user - FIXED VERSION"""
-    #     if not self.is_active or not self.noise_manager.enabled:
-    #         return agent_audio_data
-        
-    #     try:
-    #         # FIXED: Always apply background noise mixing
-    #         mixed_audio = self.noise_manager.apply_noise_to_frame(
-    #             agent_audio_data, 
-    #             len(agent_audio_data)
-    #         )
-            
-    #         # Log occasionally for debugging
-    #         if hasattr(self, '_mix_count'):
-    #             self._mix_count += 1
-    #         else:
-    #             self._mix_count = 1
-            
-    #         if self._mix_count % 500 == 0:  # Log every 500 mixes
-    #             logger.info(f"🔊 Mixed {self._mix_count} agent audio frames with background noise")
-            
-    #         return mixed_audio
-            
-    #     except Exception as e:
-    #         logger.error(f"❌ Error mixing agent audio with background: {e}")
-    #         return agent_audio_data
-    
-    def mix_agent_audio_with_background(self, agent_audio_data):
-        """Mix clean agent audio with background noise for user - ALWAYS MIX VERSION"""
-        if not self.is_active or not self.noise_manager.enabled:
-            return agent_audio_data
+    def mix_audio_chunks(self, agent_mulaw, background_mulaw):
+        """Mix agent audio with background audio (both in μ-law format)"""
+        if not agent_mulaw:
+            return background_mulaw
+        if not background_mulaw:
+            return agent_mulaw
         
         try:
-            # ALWAYS apply background noise mixing, regardless of agent speaking
-            mixed_audio = self.noise_manager.apply_noise_to_frame(
-                agent_audio_data, 
-                len(agent_audio_data)
-            )
+            # Convert both to PCM
+            agent_pcm = audioop.ulaw2lin(agent_mulaw, 2)
+            bg_pcm = audioop.ulaw2lin(background_mulaw, 2)
             
-            # Log occasionally for debugging
-            if hasattr(self, '_mix_count'):
-                self._mix_count += 1
-            else:
-                self._mix_count = 1
+            # Ensure same length
+            agent_len = len(agent_pcm)
+            bg_len = len(bg_pcm)
             
-            if self._mix_count % 500 == 0:  # Log every 500 mixes
-                logger.info(f"Mixed {self._mix_count} agent audio frames with background noise")
+            if bg_len < agent_len:
+                # Repeat background if too short
+                repetitions = (agent_len // bg_len) + 1
+                bg_pcm = (bg_pcm * repetitions)[:agent_len]
+            elif bg_len > agent_len:
+                # Truncate background if too long
+                bg_pcm = bg_pcm[:agent_len]
             
-            return mixed_audio
+            # Convert to sample arrays
+            agent_samples = array.array('h')
+            bg_samples = array.array('h')
+            
+            agent_samples.frombytes(agent_pcm)
+            bg_samples.frombytes(bg_pcm)
+            
+            # Mix samples - agent at full volume, background at configured volume
+            mixed_samples = array.array('h')
+            bg_volume = self.noise_manager.volume if self.noise_manager else 0.15
+            
+            for i in range(len(agent_samples)):
+                agent_sample = agent_samples[i]
+                bg_sample = int(bg_samples[i] * bg_volume)
+                
+                # Simple addition
+                mixed_sample = agent_sample + bg_sample
+                
+                # Clamp to prevent clipping
+                if mixed_sample > 32767:
+                    mixed_sample = 32767
+                elif mixed_sample < -32768:
+                    mixed_sample = -32768
+                
+                mixed_samples.append(mixed_sample)
+            
+            # Convert back to μ-law
+            mixed_pcm = mixed_samples.tobytes()
+            mixed_mulaw = audioop.lin2ulaw(mixed_pcm, 2)
+            
+            return mixed_mulaw
             
         except Exception as e:
-            logger.error(f"Error mixing agent audio with background: {e}")
-            return agent_audio_data
-
-
-    def _add_audio_noise(self, pcm_bytes):
-        """Add subtle noise to PCM audio to improve quality"""
-        if not self.is_active:
-            return pcm_bytes
-            
-        try:
-            pcm_array = np.frombuffer(pcm_bytes, dtype=np.int16)
-            noise = np.random.normal(0, 0.02, len(pcm_array))
-            noisy_pcm = (pcm_array + noise * 32767 * 0.1).astype(np.int16)
-            return noisy_pcm.tobytes()
-        except Exception as e:
-            logger.error(f"❌ Error adding audio noise: {e}")
-            return pcm_bytes
+            logger.error(f"❌ Error mixing audio: {e}")
+            return agent_mulaw
     
     def validate_audio_data(self, audio_data):
-        """Validate audio data before processing"""
+        """Validate audio data"""
         if not self.is_active:
             return False
             
-        if not audio_data:
-            logger.warning("⚠️ Empty audio data received")
-            return False
-            
-        if len(audio_data) == 0:
-            logger.warning("⚠️ Zero-length audio data received")
+        if not audio_data or len(audio_data) == 0:
             return False
             
         return True
     
     def stop(self):
-        """Stop audio processor immediately"""
+        """Stop audio processor"""
         logger.info("🛑 Stopping audio processor...")
         self.is_active = False
         
-        # Stop noise manager
         if self.noise_manager:
             self.noise_manager.stop()
         
         logger.info("✅ Audio processor stopped")
     
     async def cleanup(self):
-        """Clean up audio processor resources"""
+        """Cleanup resources"""
         try:
-            # Stop first
             self.stop()
             
-            # Clean up resampler
             if hasattr(self.return_resampler, 'aclose'):
                 await self.return_resampler.aclose()
             elif hasattr(self.return_resampler, 'close'):
@@ -175,49 +151,34 @@ class AudioProcessor:
                 
             logger.info("✅ Audio processor cleanup complete")
         except Exception as e:
-            logger.error(f"❌ Error cleaning up audio processor: {e}")
-    
+            logger.error(f"❌ Error cleaning up: {e}")
 
     def update_noise_settings(self, **kwargs):
-        """Update background noise settings - FIXED VERSION"""
+        """Update background noise settings"""
         if self.noise_manager:
-            # Don't clamp volume, let noise manager handle it
             self.noise_manager.update_settings(**kwargs)
             
-            # Log the actual settings applied
             status = self.noise_manager.get_status()
-            logger.info(f"Noise settings updated: enabled={status['enabled']}, "
-                    f"type={status['noise_type']}, volume={status['volume']}")
-
-
+            logger.info(f"🔊 Noise settings updated: enabled={status['enabled']}, "
+                       f"type={status.get('noise_type', 'N/A')}, "
+                       f"volume={status.get('volume', 'N/A')}")
 
     def get_background_audio_chunk(self, chunk_size):
-        """Get background audio chunk for continuous streaming - FIXED VERSION"""
+        """Get background audio chunk for mixing"""
         if not self.is_active or not self.noise_manager or not self.noise_manager.enabled:
             return None
             
-        chunk = self.noise_manager.get_background_chunk(chunk_size)
-        
-        # Add debug logging occasionally
-        if hasattr(self, '_bg_chunk_count'):
-            self._bg_chunk_count += 1
-        else:
-            self._bg_chunk_count = 1
-        
-        if self._bg_chunk_count % 1000 == 0:  # Log every 1000 chunks
-            if chunk:
-                logger.info(f"Generated background chunk #{self._bg_chunk_count}: {len(chunk)} bytes")
-            else:
-                logger.warning(f"No background chunk generated #{self._bg_chunk_count}")
+        # Get raw background chunk (volume will be applied during mixing)
+        chunk = self.noise_manager.get_background_chunk_raw(chunk_size)
         
         return chunk
 
-
     def start_background_audio(self):
-        """Start background audio streaming"""
+        """Start background audio"""
         if self.noise_manager:
             self.noise_manager.start()
-            logger.info(f"🎵 Background audio started with settings: {self.noise_manager.get_status()}")
+            status = self.noise_manager.get_status()
+            logger.info(f"🎵 Background audio started: {status}")
     
     def get_noise_status(self):
         """Get noise manager status"""
